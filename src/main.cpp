@@ -1,195 +1,126 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <asyncHTTPrequest.h>
-#include <ArduinoJson.h>
-#include <mbedtls/aes.h>
-#include <base64.h>
-//Library for OTA
-#include <HTTPClient.h>
-#include <HTTPUpdate.h>
-uint32_t LasterVersion = 0;
+// Library for NVS
+#include "nvs.h"
+#include "nvs_flash.h"
 
-const char *ssid = "Long Tran";
-const char *password = "a12345678";
+// Định nghĩa tên namespace và khóa
+#define STORAGE_NAMESPACE "storage"
+#define STORAGE_KEY "data"
 
-asyncHTTPrequest request;
-enum readyStates
-{
-  readyStateUnsent = 0,    // Client created, open not yet called
-  readyStateOpened = 1,    // open() has been called, connected
-  readyStateHdrsRecvd = 2, // send() called, response headers available
-  readyStateLoading = 3,   // receiving, partial data available
-  readyStateDone = 4       // Request complete, all data available.
-} _readyState;
+void initialize_nvs();
+void save_data_to_nvs(uint8_t data[], size_t size);
+void read_data_from_nvs(uint8_t data[], size_t size);
 
-String Encrypt(char *input)
-{
-  const char *key = "92eU5ePqsct6QwGF";
-  size_t inputSize = strlen(input);
-  uint8_t rs[inputSize]; //char *rs = (char *)malloc(sizeof(inputSize));
-  size_t keySize = strlen(key);
-  for (size_t i = 0; i < inputSize; i++)
-  {
-    rs[i] = (input[i] ^ key[i % keySize]);
-  }
-  return base64::encode(rs, inputSize);
-}
-
-//Register new tank device
-void RegisterNewTank(char *szMAC, char *szTankName)
-{
-  if (request.readyState() == readyStateUnsent || request.readyState() == readyStateDone)
-  {
-    request.open("POST", "http://npe.cotbomxang.com/api/TankAPI/Register");
-    request.setReqHeader("Content-Type", "application/json");
-
-    DynamicJsonDocument doc(1024);
-    doc["MAC"] = szMAC;
-    doc["Name"] = szTankName;
-    char checkSumParams[128];
-    sprintf(checkSumParams, "%s%s", szMAC, szTankName);
-    doc["CheckSum"] = Encrypt(checkSumParams);
-
-    String body;
-    serializeJson(doc, body);
-    request.send(body);
-  }
-}
-
-//Register new tank device
-void CheckFWUpdate()
-{
-  if (request.readyState() == readyStateUnsent || request.readyState() == readyStateDone)
-  {
-    request.open("GET", "http://npe.cotbomxang.com/api/TankAPI/CheckVersion");
-    request.send();
-  }
-}
-
-void OtaUpdate(uint32_t latestVersion)
-{
-  WiFiClient wf;
-  char url[128];
-  sprintf(url, OTAUpdateUrlC, latestVersion);
-
-  log_i("%s", url);
-
-  t_httpUpdate_return ret = httpUpdate.update(wf, url);
-  switch (ret)
-  {
-  case HTTP_UPDATE_FAILED:
-    log_e("HTTP_UPDATE_FAILED Error (%d): %s", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-    break;
-
-  case HTTP_UPDATE_NO_UPDATES:
-    log_e("HTTP_UPDATE_NO_UPDATES");
-    break;
-
-  case HTTP_UPDATE_OK:
-    log_i("HTTP_UPDATE_OK");
-    break;
-  }
-}
-
-//Push tank status
-void PushLog(char *szMAC, uint32_t iHeaderNum, char *szHeaderName, uint32_t FuelType, uint32_t HeightMax, uint32_t HeightCurrent, uint32_t VolumeMax,
-             uint32_t VolumeCurrent, uint32_t Temperature_C, char *szLocalTime)
-{
-  if (request.readyState() == readyStateUnsent || request.readyState() == readyStateDone)
-  {
-    request.open("POST", "http://npe.cotbomxang.com/api/TankAPI/PushLog");
-    request.setReqHeader("Content-Type", "application/json");
-
-    DynamicJsonDocument doc(1024);
-    doc["MAC"] = szMAC;
-    doc["HeaderNum"] = iHeaderNum;
-    doc["HeaderName"] = szHeaderName;
-    doc["GasType"] = FuelType;
-    doc["HeightMax"] = HeightMax;
-    doc["HeightCurrent"] = HeightCurrent;
-    doc["VolumeMax"] = VolumeMax;
-    doc["VolumeCurrent"] = VolumeCurrent;
-    doc["Temperature"] = Temperature_C;
-    doc["LocalTime"] = szLocalTime;
-
-    char checkSumParams[128];
-    sprintf(checkSumParams, "%s%s", szMAC, szLocalTime);
-    log_i("%s", checkSumParams);
-    doc["CheckSum"] = Encrypt(checkSumParams);
-
-    String body;
-    serializeJson(doc, body);
-    request.send(body);
-  }
-}
-
-void requestCallback(void *optParm, asyncHTTPrequest *request, int readyState)
-{
-  if (readyState == readyStateDone)
-  {
-    DynamicJsonDocument doc(1024);
-    DeserializationError error = deserializeJson(doc, request->responseText());
-    // Test if parsing succeeds.
-    if (error)
-    {
-      Serial.print(F("deserializeJson() failed: "));
-      Serial.println(error.f_str());
-      return;
-    }
-
-    uint32_t ErrorCode = 0;
-    if (doc.containsKey("ErrorCode"))
-    {
-      uint32_t ErrorCode = doc["ErrorCode"];
-    }
-
-    if (doc.containsKey("LatestVersion"))
-    {
-      LasterVersion = doc["LatestVersion"];
-    }
-  }
-}
+uint8_t data_to_save[1200] = {0};
+uint8_t data_from_nvs[1200] = {0};
+uint8_t test_counter = 0;
 
 void setup()
 {
-  Serial.begin(115200);
-  while (!Serial)
-    ;
+  log_i("Begin start project");
+  initialize_nvs();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  log_i("Connecting to Wifi");
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(100);
-    log_i(".");
-  }
-
-  Serial.printf("App Current Version: %u", FIRMWARE_VERSION);
-  //disable debug message
-  request.setDebug(false);
-  //setup callback method for non-blocking process
-  request.onReadyStateChange(requestCallback);
-
-  //Register New Tank
-  RegisterNewTank("74:dd:f5:57:ff:ff", "MonitorDevice 1");
-
-  //make sure http instance is free before next call
-  while (request.readyState() != readyStateDone)
-    yield();
-  PushLog("74:dd:f5:57:ff:ff", 1, "G12", 1, 6000, 4500, 3123123, 123123, 2231, "2020/09/30 23:59:59");
-
-  //check for new update
-  while (request.readyState() != readyStateDone)
-    yield();
-  CheckFWUpdate();
+  // Read
+  read_data_from_nvs(data_from_nvs, sizeof(data_from_nvs));
+  log_i("read_data_from_nvs start project: %d \n", data_from_nvs[5]);
+  delay(10000);
 }
 
 void loop()
 {
-  //handle ota
-  if (LasterVersion && LasterVersion > FIRMWARE_VERSION)
+  log_i("test_counter: %d", test_counter);
+  log_i("read_data_from_nvs 1: %d", data_from_nvs[5]);
+  log_i("read_data_from_nvs 1: %d", data_from_nvs[5]);
+
+  // Write
+  data_to_save[5] = test_counter;
+  save_data_to_nvs(data_to_save, sizeof(data_to_save));
+  log_i("save_data_to_nvs 2: %d", data_to_save[5]);
+
+  // Read
+  read_data_from_nvs(data_from_nvs, sizeof(data_from_nvs));
+  log_i("read_data_from_nvs 2: %d", data_from_nvs[5]);
+
+  test_counter ++; 
+  delay(2000);
+}
+
+void initialize_nvs()
+{
+  log_i("Begin initialize_nvs");
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
   {
-    OtaUpdate(LasterVersion);
+    // NVS partition was truncated and needs to be erased
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
   }
+  ESP_ERROR_CHECK(ret);
+  log_i("Finish initialize_nvs");
+}
+
+void save_data_to_nvs(uint8_t data[], size_t size)
+{
+  log_i("Begin save_data_to_nvs");
+  nvs_handle_t nvs_handle;
+  esp_err_t err;
+
+  // Mở NVS để ghi dữ liệu
+  err = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if (err != ESP_OK)
+  {
+    log_e("Error (%s) opening NVS handle!\n", esp_err_to_name(err));
+    return;
+  }
+
+  // Lưu dữ liệu vào NVS
+  err = nvs_set_blob(nvs_handle, STORAGE_KEY, data, size);
+  if (err != ESP_OK)
+  {
+    log_e("Error (%s) setting data to NVS!\n", esp_err_to_name(err));
+  }
+
+  // Đóng NVS handle
+  nvs_close(nvs_handle);
+  log_i("Finish save_data_to_nvs");
+}
+
+void read_data_from_nvs(uint8_t data[], size_t size)
+{
+  log_i("Begin read_data_from_nvs");
+  nvs_handle_t nvs_handle;
+  esp_err_t err;
+
+  err = nvs_open(STORAGE_NAMESPACE, NVS_READONLY, &nvs_handle);
+  if (err != ESP_OK)
+  {
+    log_e("Error (%s) opening NVS handle!\n", esp_err_to_name(err));
+    return;
+  }
+
+  size_t required_size;
+  // Đọc dữ liệu từ NVS
+  err = nvs_get_blob(nvs_handle, STORAGE_KEY, NULL, &required_size);
+  if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
+  {
+    log_e("Error (%s) reading data from NVS!\n", esp_err_to_name(err));
+    nvs_close(nvs_handle);
+    return;
+  }
+
+  if (required_size != size)
+  {
+    log_e("Error: Size mismatch between read data and expected data!\n");
+    nvs_close(nvs_handle);
+    return;
+  }
+
+  err = nvs_get_blob(nvs_handle, STORAGE_KEY, data, &required_size);
+  if (err != ESP_OK)
+  {
+    log_e("Error (%s) reading data from NVS!\n", esp_err_to_name(err));
+  }
+
+  nvs_close(nvs_handle);
+  log_i("Finish read_data_from_nvs");
 }
